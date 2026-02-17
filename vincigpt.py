@@ -10,6 +10,9 @@ Run:  python vincigpt.py              (interactive: pick train or infer)
 """
 
 import os, sys, json, math, time, argparse
+import subprocess
+import urllib.request
+from contextlib import nullcontext
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Optional, Tuple
@@ -18,6 +21,25 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+def _ensure_numpy_torch_compat():
+    """Fail fast if NumPy/PyTorch are mismatched (common on fresh machines)."""
+    try:
+        major = int(np.__version__.split('.', 1)[0])
+    except Exception:
+        return
+    if major >= 2:
+        try:
+            torch.from_numpy(np.array([1], dtype=np.int64))
+        except Exception as e:
+            raise RuntimeError(
+                "NumPy >= 2 detected, but this PyTorch build cannot use NumPy. "
+                "Fix: install a compatible pair, e.g. `python -m pip install 'numpy<2'` "
+                "or upgrade PyTorch to a build compiled for NumPy 2."
+            ) from e
+
+_ensure_numpy_torch_compat()
+
 
 # ─── Paths ────────────────────────────────────────────────────────────────────
 BASE_DIR       = Path(__file__).resolve().parent
@@ -273,12 +295,44 @@ def evaluate(model, loader, config, eot_id, device):
     model.train()
     return loss
 
+def _download_url(url: str, out_path: Path):
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    if out_path.exists() and out_path.stat().st_size > 0:
+        return
+    # Prefer wget (fast). Fallback to urllib if wget is missing.
+    try:
+        subprocess.run(["wget", "-q", "-O", str(out_path), url], check=True)
+    except FileNotFoundError:
+        with urllib.request.urlopen(url, timeout=60) as r, open(out_path, "wb") as f:
+            while True:
+                chunk = r.read(1024 * 1024)
+                if not chunk:
+                    break
+                f.write(chunk)
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"Download failed: {url} (wget exit {e.returncode})") from e
+
+    if not out_path.exists() or out_path.stat().st_size == 0:
+        raise RuntimeError(f"Download produced empty file: {out_path}")
+
+
 def download_data():
-    if (DATA_DIR / "TinyStoriesV2-GPT4-train.txt").exists(): return print("Data already downloaded")
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    print("Downloading TinyStories...")
+
+    need = []
     for s in ["train", "valid"]:
-        os.system(f"wget -q -P {DATA_DIR} https://huggingface.co/datasets/roneneldan/TinyStories/resolve/main/TinyStoriesV2-GPT4-{s}.txt")
+        p = DATA_DIR / f"TinyStoriesV2-GPT4-{s}.txt"
+        if not p.exists() or p.stat().st_size == 0:
+            need.append((s, p))
+
+    if not need:
+        print("Data already downloaded")
+        return
+
+    print("Downloading TinyStories...")
+    for s, p in need:
+        url = f"https://huggingface.co/datasets/roneneldan/TinyStories/resolve/main/TinyStoriesV2-GPT4-{s}.txt"
+        _download_url(url, p)
     print("Download complete")
 
 def train_tokenizer(vocab_size=32_000):
@@ -312,6 +366,10 @@ def create_binary(tokenizer, split):
                     buf = []
             elif line:
                 buf.append(line)
+        # If file doesn't end with <|endoftext|>, flush the last story
+        if buf:
+            tokens.extend(tokenizer.encode(" ".join(buf)).ids)
+            tokens.append(eot_id)
     np.array(tokens, dtype=np.uint16).tofile(path)
     print(f"{split}.bin: {len(tokens):,} tokens")
 
@@ -333,6 +391,8 @@ def train_main():
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
 
+    amp_ctx = torch.amp.autocast("cuda", dtype=torch.bfloat16) if device.type == "cuda" else nullcontext()
+
     # Data pipeline
     download_data()
     tokenizer = train_tokenizer()
@@ -347,9 +407,12 @@ def train_main():
     n_params = model.count_parameters()
     print(f"Model: {n_params:,} params ({config.num_hidden_layers}L, {config.hidden_size}D, {config.num_attention_heads}H)")
 
-    if device.type == "cuda":
-        model = torch.compile(model)
-        print("torch.compile enabled")
+    if device.type == "cuda" and os.environ.get("VGPT_NO_COMPILE", "0") != "1":
+        try:
+            model = torch.compile(model)
+            print("torch.compile enabled")
+        except Exception as e:
+            print(f"torch.compile failed ({e}); continuing without compile")
 
     # Optimizer — separate decay/no-decay
     decay = [p for n, p in model.named_parameters() if p.requires_grad and p.dim() >= 2]
@@ -389,7 +452,7 @@ def train_main():
         for _ in range(GRAD_ACCUM):
             X, Y = train_loader.get_batch(device)
             mask = build_eot_mask(X, eot_id)
-            with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+            with amp_ctx:
                 logits, _ = model(X, mask=mask)
                 loss = F.cross_entropy(logits.view(-1, config.vocab_size), Y.view(-1)) / GRAD_ACCUM
             loss.backward()
@@ -447,10 +510,11 @@ def generate(model, tokens, max_tokens=200, temperature=0.8, top_k=50, top_p=0.9
              eot_id=None, use_cache=True):
     model.eval()
     cfg = model._orig_mod.config if hasattr(model, '_orig_mod') else model.config
+    gen_amp_ctx = torch.amp.autocast("cuda", dtype=torch.bfloat16) if tokens.is_cuda else nullcontext()
     caches = None
     for _ in range(max_tokens):
         x = tokens[:, -1:] if (use_cache and caches) else tokens[:, -cfg.max_position_embeddings:]
-        with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+        with gen_amp_ctx:
             logits, new_c = model(x, use_cache=use_cache, kv_caches=caches)
         if use_cache: caches = new_c
         tok = sample_token(logits[:, -1, :].squeeze(0), temperature, top_k, top_p)
@@ -490,7 +554,13 @@ def infer_main():
 
     if args.model:
         model = GPT.from_pretrained(args.model, device=str(device))
-        from transformers import AutoTokenizer
+        try:
+            from transformers import AutoTokenizer
+        except Exception as e:
+            raise RuntimeError(
+                "Open-source model inference requires `transformers`. Install: "
+                "python -m pip install transformers huggingface-hub safetensors"
+            ) from e
         hf_tok = AutoTokenizer.from_pretrained(args.model)
         tokens = torch.tensor([hf_tok.encode(args.prompt)], dtype=torch.long, device=device)
         eot_id = hf_tok.eos_token_id
